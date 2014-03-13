@@ -1,0 +1,286 @@
+#!/usr/bin/perl -w
+# Very loosely based on http://svn.apache.org/repos/asf/spamassassin/branches/3.2/tools/check_whitelist 
+# rewrirren by DGermansa@Real-World-Systems.com
+#
+my $version = "4.02";
+my $verdate = "2014-02-07";
+my $u1 = "\nsa-heatu  Spam Assassin - Heuristic Email Address Tracker Utility v".$version." (".$verdate.")  \n".
+	 "  Written by Dennis G. German (c) 2010 <DGermansa\@Real-world-Systems.com>  \n".
+	 "  Modifications by Ivo Truxa  (c) 2014 <truxa\@truxoft.com>  \n";
+my $u2 = "  usage: sa-heatu [options...] [dbfile] [timestamps]  \n".
+	 "     Otions:  \n".
+	 "       --quiet                  no output  \n".
+	 "       --showUpdates            displays extended summary  \n".
+	 "       --verbose                print every entry (may be huge!)  \n".
+	 "       --verboseHits NN         print only entries with more than given hits  \n".
+	 "       --DONTupdateTimestamps   as written  \n".
+	 "       --noTimestamps           no timestamps processing is done  \n".
+	 "       --expireOlderThan NNN    expires entries older than NNN days. Default 730  \n".
+	 "       --prune N                remove all ham addresses with a only N hits  \n".
+	 "       --remove xxx\@yyy.zz      remove addresses (partial matches, regex!)  \n".
+	 "       --noRemoveAbove NN.N     don't expire/remove/prune entries with score > NN.N (Default 0)  \n".
+	 "       --noRename               let the original files intact, create *.out copies instead  \n".
+	 "       --changelog              display version history and exit \n".
+	 "       -v, --version            display version number and exit \n".
+	 "       -h, --help               showing this information \n\n".
+	 "     dbfile                     by default 'auto-whitelist' in the current directory  \n".
+	 "     timestamps                 by default 'timestamps' in the current directory  \n\n".
+	 "  Use command 'export COLUMNS=nnn' before running sa-heatu to adjust the email column width  \n";
+
+my $changelog =
+" 4.02 [Ivo Truxa] 02/07/2014  More cosmetic adjustments  \n".
+"	- progress bar now enabled in verbose mode too (the dots won't disturb much when         \n".
+"	  output displayed on the screen, and are wanted when output redirected to a file)       \n".
+"	- added deletion of the temporary 'out' files, hadnling with O_CREAT wasn't OK           \n".
+"	- handling of a corrupted timestamps database with blank entries                         \n".
+"	- added option --verboseHits for displaying only entries with certain minimum of his.    \n".
+"	- fixed --noRemoveAbove - did not accept the numeric value                               \n".
+" 4.01 [Ivo Truxa] 02/07/2014  More options and cosmetic adjustments for the new v4.xx           \n".
+"	- --noRemoveAbove made relevant for expiry too. By default only old ham will be expired  \n".
+"	    some people may want to keep old occasional spammers in the database for longer time \n".
+"	    with the --noRemoveAbove switch they can run two cronjobs with different settings    \n".
+"	    for expiring ham and spam, or even for several different levels of ham/spam          \n".
+"	- added renaming of files; originals are kept with the extension .bak                    \n".
+"	    (avoiding the necessity to do it manually or in a separate script)                   \n".
+"	- added parameter --noRename suppressing the file renaming (renaming enabled by default) \n".
+"	- number format for the counts of entries increase to 12 digits  \n".
+" 4.00 [Ivo Truxa] 02/06/2014  Moderate rework of v3.04  \n".
+"	- fixed db opening (failed with a fatal error on FreeBSD, because of missing R/W flags)  \n".
+"	- exact match changed to partial match or a regex, for email removal  \n".
+"	- fixed division by zero  \n".
+"	- fixed unassigned count errors  \n".
+"	- reading from the current directory instead the home dir, by default  \n".
+"	- default expiry set to 730 days (2 years)  \n".
+"	- added more detailed help on the command line  \n".
+"	- printing dots to STDERR while processing (progress bar)  \n".
+"	- removed option --firstTime - checking if timestamps file exists instead  \n".
+"	- reintroduced --prune but by default for ham (only!) addresses with given max number of recorded emails  \n".
+"	- messages not intended for the log or file redirection are printed to the STDERR now  \n".
+"	- moved message 'export COLUMNS=nnn...' to the help  \n".
+"	- removed footing (was cluttering logs)  \n".
+"	- some extra opening messages added (i.e. prune value)  \n".
+"	- rehashed, slightly more structuralized logics of record processing  \n".
+"	- diverse cosmetic adjustments  \n".
+"	- added parameter --neverRemoveAbove to avoid deleting known spammers  \n".
+"	- added parameter --changelog for displaying this version history  \n".
+"\n".
+" 3.xx [Dennis G. German]\n".
+" 3.04 add NL between u1 and u2  \n".
+" 3.03 fix DONT display time for new entries when \$twas == 0  \n".
+" 3.02 correct  -noTimestamps spelling was noTimesamps  second t missing AND disptime =\"\" if noTimestamps  \n".
+" 3.01 in -> out to clean up deletes. prune makes no sense, removed. Display timestamps  \n".
+" 3.00 add timestamps file  \n".
+" 3.01 don't show day o week or seconds since it it sa-heatu runtime, reduce size of timestamp by keeping it in minutes  \n".
+" simple: copy autowhite-list entries to output,  \n".
+"         while updating a timestamp file by taking count from auto-whitelist and incuding a timestamp to new entries  \n".
+"         meanwhile skipping old entries (effectively deleting them),  \n".
+"         removing a specific entry and  \n".
+"         displaying the total score, average, count, email, IP, firstSeen  \n".
+" all the other code is deciding what to display  \n".
+" autowhite-list is opened RDWR to minimize attempts by spamd to update while we are running. (not the best)  \n".
+" after  sa-heatu completes:  \n".
+"   mv auto-whitelist  auto-whitelist-1  \n".
+"   mv auto-whitelisto auto-whitelist  \n".
+"   mv timestamps  timestamps-1  \n".
+"   mv timestampso timestamps  \n".
+"\n";
+
+sub usage { print $u1,"\n",$u2; exit 0;}
+
+use strict;
+use Fcntl;
+use Getopt::Long;						# http://perldoc.perl.org/Getopt/Long.html
+use English;							# get descriptive names for built-in variables
+
+$OUTPUT_AUTOFLUSH = 1;
+$OUTPUT_RECORD_SEPARATOR ="\n";					# print (not printf !)
+
+my $false=0; my $true=1; 
+my ($db, $ts, $dbo, $tso, %h,  %t, %ho,  %to, @k, $k, @tk, $tk, $tkey, $tcount, $twas);
+my ($key,  $email,  $ip,  $totscore,  $count);
+my ($width,  $fmt, $disptime,  $reason,  $prt,  $prtu, $skipf,  $tstamp, $lastUpdate, $oldest);
+my $numc=0; my $remc=0;  my $tnewc=0; my $updatedc=0; my $expiredc=0; my $wouldbe=""; my $malformedc=0;
+my $entrieso=0;
+
+use vars qw($opt_min $opt_help $opt_showUpdates $opt_verbose $opt_verboseHits $opt_remove $opt_quiet $opt_prune $opt_NoTimes $opt_NoUTimes $opt_XOT $opt_firstTimes $opt_version $opt_maxScore $opt_changelog $opt_noRename); 
+GetOptions(
+  'help'		=> \$opt_help,
+  'showUpdates'		=> \$opt_showUpdates,
+  'verbose'		=> \$opt_verbose,
+  'verboseHits=i'	=> \$opt_verboseHits,
+  'noTimestamps'	=> \$opt_NoTimes,
+  'DONTupdatetimestamps'=> \$opt_NoUTimes,
+  'expireOlderThan=i'	=> \$opt_XOT,				# can't --remove and --expire 
+  'firstTimes'		=> \$opt_firstTimes,			# not needed anymore, but kept
+  'remove=s'		=> \$opt_remove,			# can't --remove and --expire 
+  'prune=i'		=> \$opt_prune,				# deprecated, just ignore
+  'quiet'		=> \$opt_quiet,
+  'v'			=> \$opt_version,
+  'version'		=> \$opt_version,
+  'changelog'		=> \$opt_changelog,
+  'noRename'		=> \$opt_noRename,
+  'noRemoveAbove=f'	=> \$opt_maxScore
+) or usage();
+
+$opt_help and usage();
+$opt_verbose	 ||= 0;
+$opt_verboseHits ||= 0;
+$opt_NoTimes	 ||= 0;
+$opt_NoUTimes	 ||= 0;
+$opt_XOT	 ||= 730;
+$opt_firstTimes	 ||= 0;
+$opt_prune	 ||= 0;
+$opt_remove	 ||= "";
+$opt_showUpdates ||= 0;
+$opt_version	 ||= 0;
+$opt_maxScore	 ||= 0;
+$opt_noRename	 ||= 0;
+
+if ($opt_version) {print "sa-heatu v".$version." (".$verdate.")\n"; exit 0;}
+
+
+BEGIN { @AnyDBM_File::ISA = qw(DB_File GDBM_File NDBM_File SDBM_File); }
+use AnyDBM_File ;
+if(!$opt_quiet) {
+    print STDERR $u1;
+    if ($opt_changelog)	{print  $changelog; exit 0;}
+    if ($opt_NoUTimes)	{print  "  No updating of times will be done  ";}
+    if ($opt_NoTimes)	{print  "  No timestamp processing will be performed  ";}
+    if ($opt_prune)	{printf "  Ham addresses with max %i received messages will be removed  \n", $opt_prune;}
+}
+if (defined $ENV{COLUMNS}) {$width= ($ENV{COLUMNS}-66).""; } else {$width=40;}
+if ($#ARGV == -1) {$db = "auto-whitelist"; } else {$db = $ARGV[0];} $dbo = $db.".out"; 
+if ($#ARGV !=  1) {$ts = "timestamps";     } else {$ts = $ARGV[1];} $tso = $ts.".out";
+
+tie %h, "AnyDBM_File",$db,  O_RDWR,  0600 or die "Cannot open   \"$db\" $!\n";	# use O_RDWR to keep spamd away
+if (!$opt_quiet) {print STDERR "  Reading $db ";} 
+
+unlink $dbo, $tso;	# need to delete, O_CREAT alone can't be used, and with O_RDWR .default) it does not delete
+tie %ho,"AnyDBM_File",$dbo or die "Cannot create \"$dbo\" $!\n";
+if (!$opt_quiet) {print STDERR "  Writing $dbo  ";}
+
+$opt_remove = lc($opt_remove);							# If he specified mixed case change uppercase -> lower 
+if ($opt_remove ne "" && !$opt_quiet) {print STDERR "Attemptimng removal of: \"$opt_remove\" ";} 
+
+if (!$opt_NoTimes) {
+    if (-e $ts) {
+	tie %t,  "AnyDBM_File",$ts,  O_RDONLY,  0600 or die "Cannot open: \"$ts\"    $!    \n"; 
+	if (!$opt_quiet) 
+	    {print STDERR "  Reading $ts ";} 
+    } else  {$opt_firstTimes = $true;}
+    tie  %to, "AnyDBM_File",$tso or die "Cannot create:\"$tso\" $!    \n"; 
+    if (!$opt_quiet) {print STDERR "  Writing $tso  ";} 
+    if (!$opt_firstTimes) {
+	@tk = grep(!/00-lastupdate$/,keys(%t));
+	$lastUpdate = $t{"00-lastupdate"};
+	if (defined $lastUpdate && !$opt_quiet) 
+	     {print "  Timestamps last updated:". localtime($lastUpdate);}
+	else {die " !! lastupdate key \"00-lastupdate\" is missing!! Did you mean to use --firstTimes ? \n\n";}
+
+	$opt_XOT = time - $opt_XOT*24*3600;			# days to minutes, to seconds  prior to now
+	if ($opt_XOT > 0) {$fmt=localtime($opt_XOT); printf "  Expiring entries with score above %.2f not seen since $fmt", $opt_maxScore;}
+    }								# not first time
+}								# !NoTimes    i.e.  timestamps active
+
+@k = grep(!/totscore$/,keys(%h));				# make an array of keys excluding the totscore keys
+# generate the formatting specs, vary the width of the email shown based on how wide the display is
+$fmt =    "\n %7.1f %9.1f %3d   %-" . $width . "s %7s; %12s ";  
+
+if (!$opt_quiet){
+    print STDERR "  Processing database:  \n".
+		 "    Each dot represents 10,000 entries processed  \n".
+		 "    Each full line represents half a million of entries  ";
+    printf STDERR "%s","    ";					# avoiding the linefeed here
+    if ($opt_verbose || $opt_verboseHits) {print "\n average   total   count   ";}
+}
+
+for $key (@k) {
+    $numc ++;
+    $reason	= "";
+    $skipf	= $false; 
+    $totscore	= $h{"$key|totscore"}; if (!defined $totscore) {$malformedc++; next;}
+    $prtu	= $false;					# candidate for print updates?
+    $count	= $h{$key} || 1;				# avoid division by zero (yes, there are entries with 0 count)
+    $tcount	= $count;					# use count from awl for new or unchanged entries
+    ($email	= $key)     =~ s/\|.*//;			# clear |ip=nnn.nnn from key
+    ($ip	= $key)     =~ s/.*\|ip=//;			# clear email@dom.tld|ip=  from key, leaving  nnn.nnn
+
+    if (!$opt_quiet) {						# using printf, print appends a newline by default
+	if (!($numc%10000)) {printf STDERR "%s",   '.'};	# progress bar dots
+	if (!($numc%500000)){printf STDERR "\n%s", '    '};	# new progress bar line
+    }
+    if	  ($totscore<=$opt_maxScore && $email =~ m/$opt_remove/i) {$remc++; $reason="remvd,"; $prtu=$true; $skipf=$true;}
+    elsif ($totscore<=$opt_maxScore && $count<=$opt_prune) 	  {$remc++; $reason="prune,"; $prtu=$true; $skipf=$true;}
+    elsif ($opt_NoTimes) {;}					# do nothing anymore
+    elsif ($opt_firstTimes)		  {$tnewc++; $twas=0; $tstamp=time; $reason="";}
+    elsif (!defined $t{$key})		  {$tnewc++; $twas=0; $tstamp=time; $reason="new,  "; $prtu=$true;}
+    else {
+	($twas	 = $t{$key}) =~ s/,.*//;			# clear, and count leaving time
+	($tcount = $t{$key}) =~ s/.*,//;			# clear beginning of time entry leaving tcount
+	if    (($tcount||0) < $count)	  {$updatedc++;       $tstamp=time; $reason="updtd,"; $prtu=$true; $tcount=$count;} 
+	elsif ($totscore<=$opt_maxScore && $twas<$opt_XOT)   {$expiredc++;  $reason="exprd,"; $prtu=$true; $skipf=$true;} 
+	else						     {$tstamp=$twas;$reason="kept, ";}
+    }
+    if ($count && ($opt_verbose || ($opt_verboseHits && $count>$opt_verboseHits) || ($opt_showUpdates && $prtu))) {
+	printf $fmt, $totscore/$count, $totscore,$count, $email, $ip, $reason;
+	if (!$opt_NoTimes && (($twas||0)!=0))
+	    {printf "%s", ((localtime $twas) =~ s/... //r =~ s/:.. / /r);}		# don't include d-o-w, and drop seconds as that implies precision
+    }
+    if (!$skipf) {
+	$entrieso++;
+	$ho{$key}	     = $h{$key} ;
+	$ho{"$key|totscore"} = $h{"$key|totscore"};		# how ugly is this key!
+	if (!$opt_NoTimes) {$to{$key} = ($opt_NoUTimes)? $t{key} : $tstamp.",".$tcount;}
+    }								# !skip
+}								# end for key  next 
+if (!$opt_quiet) {print STDERR "\n";}				# new line separation
+
+$to{"00-lastupdate"}=time;
+untie %h; untie %ho;
+untie %t; untie %to;
+
+if ($opt_NoUTimes){$wouldbe=" would be";}
+if (!$opt_quiet ){ 
+    printf "\n\n%12d entries removed.                \n", $remc;
+    printf "%12d entries". $wouldbe." expired.       \n", $expiredc;
+    printf "%12d timestamps". $wouldbe." added.      \n", $tnewc;
+    printf "%12d timestamps". $wouldbe." updated.    \n", $updatedc;
+    if ($malformedc)
+	{printf "%12d missing \"totscore\"           \n", $malformedc; }	
+    printf "\n%12d entries input.                    \n", $numc;
+    printf "%12d entries output = input - expired - removed.   \n\n", $entrieso;
+}
+
+if (!$opt_noRename) {
+    rename $db,  $db.".bak" or die "Cannot rename file ".$db. " to ".$db.".bak  \n";
+    rename $dbo, $db	or die "Cannot rename file ".$dbo." to ".$db."      \n";
+    rename $ts,  $ts.".bak" or die "Cannot rename file ".$ts. " to ".$ts.".bak  \n";
+    rename $tso, $ts	or die "Cannot rename file ".$tso." to ".$ts."      \n";
+    if (!$opt_quiet) {print "auto-whitelist, timestamps updated, and originals backed up.";}
+}
+
+exit 0 ;
+
+# I would appreciate notification if you distribute or modify this program 
+# of if you have ideas on how to improve it.
+#   DGermansa@Real-World-Systems.com
+#
+#   License:
+#       This program is free software; you can redistribute it and/or modify
+#       it under the terms of the GNU General Public License as published by
+#       the Free Software Foundation; either version 2 of the License, or
+#       (at your option) any later version.
+#
+#       This program is distributed in the hope that it will be useful,
+#       but WITHOUT ANY WARRANTY; without even the implied warranty of
+#       MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+#       See the GNU General Public License for more details.
+#
+#       You should have received a copy of the GNU General Public License
+#       along with this program. If not, see <http://www.gnu.org/licenses/>.  
+#  Copyright (C) 2010 Dennis G German <DGermansa@Real-World-Systems.com>
+#
+# cd ~/.spamassassin
+# tar -vcf sa-heatu.3.xx.tar sa-heatu sa-heatu.readme sa-heatu.html 64c.hexdump style.css COPYING
+# mv sa-heatu.*.tar ~/www/mail
+#
